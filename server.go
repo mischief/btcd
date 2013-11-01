@@ -6,6 +6,7 @@ package main
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"github.com/conformal/btcdb"
 	"github.com/conformal/btcwire"
@@ -60,6 +61,7 @@ type server struct {
 	donePeers     chan *peer
 	banPeers      chan *peer
 	wakeup        chan bool
+	query         chan interface{}
 	relayInv      chan *btcwire.InvVect
 	broadcast     chan broadcastMsg
 	wg            sync.WaitGroup
@@ -193,7 +195,124 @@ func (s *server) handleBroadcastMsg(peers *list.List, bmsg *broadcastMsg) {
 			excluded = true
 		}
 		if !excluded {
-			p.QueueMessage(bmsg.message)
+			p.QueueMessage(bmsg.message, nil)
+		}
+	}
+}
+
+// Peerinfo represents the information requested by the getpeerinfo rpc command.
+type PeerInfo struct {
+	Addr           string
+	Services       btcwire.ServiceFlag
+	LastSend       time.Time
+	LastRecv       time.Time
+	BytesSent      int
+	BytesRecv      int
+	ConnTime       time.Time
+	Version        uint32
+	SubVer         string
+	Inbound        bool
+	StartingHeight int32
+	BanScore       int
+	SyncNode       bool
+}
+
+type getConnCountMsg struct {
+	reply chan int
+}
+
+type getPeerInfoMsg struct {
+	reply chan []*PeerInfo
+}
+
+type addNodeMsg struct {
+	addr      string
+	permanent bool
+	reply     chan error
+}
+
+type delNodeMsg struct {
+	addr  string
+	reply chan error
+}
+
+// handleQuery is the central handler for all queries and commands from other
+// goroutines related to peer state.
+func (s *server) handleQuery(querymsg interface{}, peers *list.List, bannedPeers map[string]time.Time) {
+	switch msg := querymsg.(type) {
+	case getConnCountMsg:
+		nconnected := 0
+		for e := peers.Front(); e != nil; e = e.Next() {
+			peer := e.Value.(*peer)
+			if peer.Connected() {
+				nconnected++
+			}
+		}
+
+		msg.reply <- nconnected
+	case getPeerInfoMsg:
+		infos := make([]*PeerInfo, 0, peers.Len())
+		for e := peers.Front(); e != nil; e = e.Next() {
+			peer := e.Value.(*peer)
+			if !peer.Connected() {
+				continue
+			}
+			// A lot of this will make the race detector go mad,
+			// however it is statistics for purely informational purposes
+			// and we don't really care if they are raced to get the new
+			// version.
+			info := &PeerInfo{
+				Addr:           peer.addr,
+				Services:       peer.services,
+				LastSend:       peer.lastSend,
+				LastRecv:       peer.lastRecv,
+				BytesSent:      0, // TODO(oga) we need this from wire.
+				BytesRecv:      0, // TODO(oga) we need this from wire.
+				ConnTime:       peer.timeConnected,
+				Version:        peer.protocolVersion,
+				SubVer:         peer.userAgent,
+				Inbound:        peer.inbound,
+				StartingHeight: peer.lastBlock,
+				BanScore:       0,
+				SyncNode:       false, // TODO(oga) for now. bm knows this.
+			}
+			infos = append(infos, info)
+		}
+		msg.reply <- infos
+	case addNodeMsg:
+		// TODO(oga) really these checks only apply to permanent peers.
+		for e := peers.Front(); e != nil; e = e.Next() {
+			peer := e.Value.(*peer)
+			if peer.addr == msg.addr {
+				msg.reply <- errors.New("peer already connected")
+				return
+			}
+		}
+		// TODO(oga) if too many, nuke a non-perm peer.
+		if s.handleAddPeerMsg(peers, bannedPeers,
+			newOutboundPeer(s, msg.addr, msg.permanent)) {
+			msg.reply <- nil
+		} else {
+			msg.reply <- errors.New("failed to add peer")
+		}
+
+	case delNodeMsg:
+		found := false
+		// TODO(oga) really these checks only apply to permanent peers.
+		for e := peers.Front(); e != nil; e = e.Next() {
+			peer := e.Value.(*peer)
+			if peer.addr == msg.addr {
+				peer.persistent = false // XXX hack!
+				peer.Disconnect()
+				found = true
+				break
+			}
+		}
+
+		if found {
+			msg.reply <- nil
+		} else {
+			msg.reply <- errors.New("peer not found")
 		}
 	}
 }
@@ -332,6 +451,9 @@ out:
 		case <-s.wakeup:
 			// this page left intentionally blank
 
+		case qmsg := <-s.query:
+			s.handleQuery(qmsg, peers, bannedPeers)
+
 		// Shutdown the peer handler.
 		case <-s.quit:
 			// Shutdown peers.
@@ -454,6 +576,46 @@ func (s *server) BroadcastMessage(msg btcwire.Message, exclPeers ...*peer) {
 	// broadcast and refrain from broadcasting again.
 	bmsg := broadcastMsg{message: msg, excludePeers: exclPeers}
 	s.broadcast <- bmsg
+}
+
+// ConnectedCount returns the number of currently connected peers.
+func (s *server) ConnectedCount() int {
+	replyChan := make(chan int)
+
+	s.query <- getConnCountMsg{reply: replyChan}
+
+	return <-replyChan
+}
+
+// PeerInfo returns an array of PeerInfo structures describing all connected
+// peers.
+func (s *server) PeerInfo() []*PeerInfo {
+	replyChan := make(chan []*PeerInfo)
+
+	s.query <- getPeerInfoMsg{reply: replyChan}
+
+	return <-replyChan
+}
+
+// AddAddr adds `addr' as a new outbound peer. If permanent is true then the
+// peer will be persistent and reconnect if the connection is lost.
+// It is an error to call this with an already existing peer.
+func (s *server) AddAddr(addr string, permanent bool) error {
+	replyChan := make(chan error)
+
+	s.query <- addNodeMsg{addr: addr, permanent: permanent, reply: replyChan}
+
+	return <-replyChan
+}
+
+// RemoveAddr removes `addr' from the list of persistent peers if present.
+// An error will be returned if the peer was not found.
+func (s *server) RemoveAddr(addr string) error {
+	replyChan := make(chan error)
+
+	s.query <- delNodeMsg{addr: addr, reply: replyChan}
+
+	return <-replyChan
 }
 
 // Start begins accepting connections from peers.
@@ -594,6 +756,7 @@ func newServer(addr string, db btcdb.Db, btcnet btcwire.BitcoinNet) (*server, er
 		donePeers:   make(chan *peer, cfg.MaxPeers),
 		banPeers:    make(chan *peer, cfg.MaxPeers),
 		wakeup:      make(chan bool),
+		query:       make(chan interface{}),
 		relayInv:    make(chan *btcwire.InvVect, cfg.MaxPeers),
 		broadcast:   make(chan broadcastMsg, cfg.MaxPeers),
 		quit:        make(chan bool),

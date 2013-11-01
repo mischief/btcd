@@ -10,10 +10,12 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"runtime/pprof"
 )
 
 var (
-	cfg *config
+	cfg             *config
+	shutdownChannel = make(chan bool)
 )
 
 // btcdMain is the real main function for btcd.  It is necessary to work around
@@ -43,13 +45,27 @@ func btcdMain() error {
 	// Show version at startup.
 	log.Infof("Version %s", version())
 
-	// See if we want to enable profiling.
+	// Enable http profiling server if requested.
 	if cfg.Profile != "" {
 		go func() {
 			listenAddr := net.JoinHostPort("", cfg.Profile)
 			log.Infof("Profile server listening on %s", listenAddr)
+			profileRedirect := http.RedirectHandler("/debug/pprof",
+				http.StatusSeeOther)
+			http.Handle("/", profileRedirect)
 			log.Errorf("%v", http.ListenAndServe(listenAddr, nil))
 		}()
+	}
+
+	// Write cpu profile if requested.
+	if cfg.CpuProfile != "" {
+		f, err := os.Create(cfg.CpuProfile)
+		if err != nil {
+			log.Errorf("Unable to create cpu profile: %v", err)
+			return err
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
 
 	// Perform upgrades to btcd as new versions require it.
@@ -68,6 +84,7 @@ func btcdMain() error {
 
 	// Ensure the database is sync'd and closed on Ctrl+C.
 	addInterruptHandler(func() {
+		log.Infof("Gracefully shutting down the database...")
 		db.RollbackClose()
 	})
 
@@ -80,7 +97,21 @@ func btcdMain() error {
 	}
 	server.Start()
 
-	server.WaitForShutdown()
+	// Monitor for graceful server shutdown and signal the main goroutine
+	// when done.  This is done in a separate goroutine rather than waiting
+	// directly so the main goroutine can be signaled for shutdown by either
+	// a graceful shutdown or from the main interrupt handler.  This is
+	// necessary since the main goroutine must be kept running long enough
+	// for the interrupt handler goroutine to finish.
+	go func() {
+		server.WaitForShutdown()
+		shutdownChannel <- true
+	}()
+
+	// Wait for shutdown signal from either a graceful server stop or from
+	// the interrupt handler.
+	<-shutdownChannel
+	log.Info("Shutdown complete")
 	return nil
 }
 

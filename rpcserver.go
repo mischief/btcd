@@ -19,7 +19,6 @@ import (
 	"github.com/conformal/btcscript"
 	"github.com/conformal/btcutil"
 	"github.com/conformal/btcwire"
-	"github.com/davecgh/go-spew/spew"
 	"math/big"
 	"net"
 	"net/http"
@@ -31,6 +30,8 @@ import (
 
 // Errors
 var (
+	// ErrBadParamsField describes an error where the parameters JSON
+	// field cannot be properly parsed.
 	ErrBadParamsField = errors.New("bad params field")
 )
 
@@ -52,40 +53,127 @@ type rpcServer struct {
 // wsContext holds the items the RPC server needs to handle websocket
 // connections for wallets.
 type wsContext struct {
-	// txRequests maps between a 160-byte pubkey hash and slice of contexts
-	// to route replies back to the original requesting wallets.
-	txRequests struct {
+	// walletListeners holds a map of each currently connected wallet
+	// listener as the key.  The value is ignored, as this is only used as
+	// a set.  A mutex is used to prevent incorrect multiple access.
+	walletListeners struct {
 		sync.RWMutex
-		m map[addressHash][]requesterContext
+		m map[chan []byte]bool
 	}
 
-	// spentRequests maps between the Outpoint of an unspent transaction
-	// output and a slice of contexts to route notifications back to the
-	// original requesting wallets.
-	spentRequests struct {
-		sync.RWMutex
-		m map[btcwire.OutPoint][]requesterContext
-	}
-
-	// Channel to add a wallet listener.
-	addWalletListener chan (chan []byte)
-
-	// Channel to removes a wallet listener.
-	removeWalletListener chan (chan []byte)
+	// requests holds all wallet notification requests.
+	requests wsRequests
 
 	// Any chain notifications meant to be received by every connected
 	// wallet are sent across this channel.
 	walletNotificationMaster chan []byte
 }
 
+// wsRequests maps request contexts for wallet notifications to a
+// wallet notification channel.  A Mutex is used to protect incorrect
+// concurrent access to the map.
+type wsRequests struct {
+	sync.Mutex
+	m map[chan []byte]*requestContexts
+}
+
+// getOrCreateContexts gets the request contexts, or creates and adds a
+// new context if one for this wallet is not already present.
+func (r *wsRequests) getOrCreateContexts(walletNotification chan []byte) *requestContexts {
+	rc, ok := r.m[walletNotification]
+	if !ok {
+		rc = &requestContexts{
+			txRequests:      make(map[addressHash]interface{}),
+			spentRequests:   make(map[btcwire.OutPoint]interface{}),
+			minedTxRequests: make(map[btcwire.ShaHash]bool),
+		}
+		r.m[walletNotification] = rc
+	}
+	return rc
+}
+
+// AddTxRequest adds the request context for new transaction notifications.
+func (r *wsRequests) AddTxRequest(walletNotification chan []byte, addr addressHash, id interface{}) {
+	r.Lock()
+	defer r.Unlock()
+
+	rc := r.getOrCreateContexts(walletNotification)
+	rc.txRequests[addr] = id
+}
+
+// AddSpentRequest adds a request context for notifications of a spent
+// Outpoint.
+func (r *wsRequests) AddSpentRequest(walletNotification chan []byte, op *btcwire.OutPoint, id interface{}) {
+	r.Lock()
+	defer r.Unlock()
+
+	rc := r.getOrCreateContexts(walletNotification)
+	rc.spentRequests[*op] = id
+}
+
+// RemoveSpentRequest removes a request context for notifications of a
+// spent Outpoint.
+func (r *wsRequests) RemoveSpentRequest(walletNotification chan []byte, op *btcwire.OutPoint) {
+	r.Lock()
+	defer r.Unlock()
+
+	rc := r.getOrCreateContexts(walletNotification)
+	delete(rc.spentRequests, *op)
+}
+
+// AddMinedTxRequest adds request contexts for notifications of a
+// mined transaction.
+func (r *wsRequests) AddMinedTxRequest(walletNotification chan []byte, txID *btcwire.ShaHash) {
+	r.Lock()
+	defer r.Unlock()
+
+	rc := r.getOrCreateContexts(walletNotification)
+	rc.minedTxRequests[*txID] = true
+}
+
+// RemoveMinedTxRequest removes request contexts for notifications of a
+// mined transaction.
+func (r *wsRequests) RemoveMinedTxRequest(walletNotification chan []byte, txID *btcwire.ShaHash) {
+	r.Lock()
+	defer r.Unlock()
+
+	rc := r.getOrCreateContexts(walletNotification)
+	delete(rc.minedTxRequests, *txID)
+}
+
+// CloseListeners removes all request contexts for notifications sent
+// to a wallet notification channel and closes the channel to stop all
+// goroutines currently serving that wallet.
+func (r *wsRequests) CloseListeners(walletNotification chan []byte) {
+	r.Lock()
+	defer r.Unlock()
+
+	delete(r.m, walletNotification)
+	close(walletNotification)
+}
+
 type addressHash [ripemd160.Size]byte
 
-// requesterContext holds a slice of reply channels for wallets
-// requesting information about some address, and the id of the original
-// request so notifications can be routed back to the appropiate handler.
-type requesterContext struct {
-	c  chan *btcjson.Reply
-	id interface{}
+// requestContexts holds all requests for a single wallet connection.
+type requestContexts struct {
+	// txRequests maps between a 160-byte pubkey hash and the JSON
+	// id of the requester so replies can be correctly routed back
+	// to the correct btcwallet callback.
+	txRequests map[addressHash]interface{}
+
+	// spentRequests maps between an Outpoint of an unspent
+	// transaction output and the JSON id of the requester so
+	// replies can be correctly routed back to the correct
+	// btcwallet callback.
+	spentRequests map[btcwire.OutPoint]interface{}
+
+	// minedTxRequests holds a set of transaction IDs (tx hashes) of
+	// transactions created by a wallet. A wallet may request
+	// notifications of when a tx it created is mined into a block and
+	// removed from the mempool.  Once a tx has been mined into a
+	// block, wallet may remove the raw transaction from its unmined tx
+	// pool.
+	minedTxRequests map[btcwire.ShaHash]bool
 }
 
 // Start is used by server.go to start the rpc listener.
@@ -95,7 +183,9 @@ func (s *rpcServer) Start() {
 	}
 
 	log.Trace("RPCS: Starting RPC server")
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	rpcServeMux := http.NewServeMux()
+	httpServer := &http.Server{Handler: rpcServeMux}
+	rpcServeMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		login := s.username + ":" + s.password
 		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
 		authhdr := r.Header["Authorization"]
@@ -107,10 +197,9 @@ func (s *rpcServer) Start() {
 		}
 	})
 	go s.walletListenerDuplicator()
-	http.Handle("/wallet", websocket.Handler(func(ws *websocket.Conn) {
+	rpcServeMux.Handle("/wallet", websocket.Handler(func(ws *websocket.Conn) {
 		s.walletReqsNotifications(ws)
 	}))
-	httpServer := &http.Server{}
 	for _, listener := range s.listeners {
 		s.wg.Add(1)
 		go func(listener net.Listener) {
@@ -146,6 +235,7 @@ func (s *rpcServer) Stop() error {
 func newRPCServer(s *server) (*rpcServer, error) {
 	rpc := rpcServer{
 		server: s,
+		quit:   make(chan int),
 	}
 	// Get values from config
 	rpc.rpcport = cfg.RPCPort
@@ -153,10 +243,8 @@ func newRPCServer(s *server) (*rpcServer, error) {
 	rpc.password = cfg.RPCPass
 
 	// initialize memory for websocket connections
-	rpc.ws.txRequests.m = make(map[addressHash][]requesterContext)
-	rpc.ws.spentRequests.m = make(map[btcwire.OutPoint][]requesterContext)
-	rpc.ws.addWalletListener = make(chan (chan []byte))
-	rpc.ws.removeWalletListener = make(chan (chan []byte))
+	rpc.ws.requests.m = make(map[chan []byte]*requestContexts)
+	rpc.ws.walletListeners.m = make(map[chan []byte]bool)
 	rpc.ws.walletNotificationMaster = make(chan []byte)
 
 	// IPv4 listener.
@@ -191,51 +279,457 @@ func jsonAuthFail(w http.ResponseWriter, r *http.Request, s *rpcServer) {
 // jsonRPCRead is the RPC wrapper around the jsonRead function to handles
 // reading and responding to RPC messages.
 func jsonRPCRead(w http.ResponseWriter, r *http.Request, s *rpcServer) {
-	_ = spew.Dump
 	r.Close = true
 	if atomic.LoadInt32(&s.shutdown) != 0 {
 		return
 	}
 	body, err := btcjson.GetRaw(r.Body)
-	spew.Dump(body)
 	if err != nil {
 		log.Errorf("RPCS: Error getting json message: %v", err)
 		return
 	}
 
-	replychan := make(chan *btcjson.Reply)
-	if err = jsonRead(replychan, body, s); err != nil {
-		log.Error(err)
+	// Error is intentionally ignored here.  It's used in in the
+	// websocket handler to tell when a method is not supported by
+	// the standard RPC API, and is not needed here.  Error logging
+	// is done inside jsonRead, so no need to log the error here.
+	reply, _ := jsonRead(body, s, nil)
+	log.Tracef("[RPCS] reply: %v", reply)
+
+	msg, err := btcjson.MarshallAndSend(reply, w)
+	if err != nil {
+		log.Errorf(msg)
 		return
 	}
-	reply := <-replychan
+	log.Debugf(msg)
+}
 
-	if reply != nil {
-		log.Tracef("[RPCS] reply: %v", *reply)
-		msg, err := btcjson.MarshallAndSend(*reply, w)
+type commandHandler func(*rpcServer, btcjson.Cmd, chan []byte) (interface{}, error)
+
+var handlers = map[string]commandHandler{
+	"addnode":              handleAddNode,
+	"decoderawtransaction": handleDecodeRawTransaction,
+	"getbestblockhash":     handleGetBestBlockHash,
+	"getblock":             handleGetBlock,
+	"getblockcount":        handleGetBlockCount,
+	"getblockhash":         handleGetBlockHash,
+	"getconnectioncount":   handleGetConnectionCount,
+	"getdifficulty":        handleGetDifficulty,
+	"getgenerate":          handleGetGenerate,
+	"gethashespersec":      handleGetHashesPerSec,
+	"getpeerinfo":          handleGetPeerInfo,
+	"getrawmempool":        handleGetRawMempool,
+	"getrawtransaction":    handleGetRawTransaction,
+	"sendrawtransaction":   handleSendRawTransaction,
+	"setgenerate":          handleSetGenerate,
+	"stop":                 handleStop,
+}
+
+// handleDecodeRawTransaction handles decoderawtransaction commands.
+func handleAddNode(s *rpcServer, cmd btcjson.Cmd,
+	walletNotification chan []byte) (interface{}, error) {
+	c := cmd.(*btcjson.AddNodeCmd)
+
+	addr := normalizePeerAddress(c.Addr)
+	var err error
+	switch c.SubCmd {
+	case "add":
+		err = s.server.AddAddr(addr, true)
+	case "remove":
+		err = s.server.RemoveAddr(addr)
+	case "onetry":
+		err = s.server.AddAddr(addr, false)
+	default:
+		err = errors.New("Invalid subcommand for addnode")
+	}
+
+	// no data returned unless an error.
+	return nil, err
+}
+
+// handleDecodeRawTransaction handles decoderawtransaction commands.
+func handleDecodeRawTransaction(s *rpcServer, cmd btcjson.Cmd,
+	walletNotification chan []byte) (interface{}, error) {
+	// TODO: use c.HexTx and fill result with info.
+	return btcjson.TxRawDecodeResult{}, nil
+}
+
+// handleGetBestBlockHash implements the getbestblockhash command.
+func handleGetBestBlockHash(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	var sha *btcwire.ShaHash
+	sha, _, err := s.server.db.NewestSha()
+	if err != nil {
+		log.Errorf("RPCS: Error getting newest sha: %v", err)
+		return nil, btcjson.ErrBestBlockHash
+	}
+
+	return sha.String, nil
+}
+
+// handleGetBlock implements the getblock command.
+func handleGetBlock(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	c := cmd.(*btcjson.GetBlockCmd)
+	sha, err := btcwire.NewShaHashFromStr(c.Hash)
+	if err != nil {
+		log.Errorf("RPCS: Error generating sha: %v", err)
+		return nil, btcjson.ErrBlockNotFound
+	}
+	blk, err := s.server.db.FetchBlockBySha(sha)
+	if err != nil {
+		log.Errorf("RPCS: Error fetching sha: %v", err)
+		return nil, btcjson.ErrBlockNotFound
+	}
+	idx := blk.Height()
+	buf, err := blk.Bytes()
+	if err != nil {
+		log.Errorf("RPCS: Error fetching block: %v", err)
+		return nil, btcjson.ErrBlockNotFound
+	}
+
+	txList, _ := blk.TxShas()
+
+	txNames := make([]string, len(txList))
+	for i, v := range txList {
+		txNames[i] = v.String()
+	}
+
+	_, maxidx, err := s.server.db.NewestSha()
+	if err != nil {
+		log.Errorf("RPCS: Cannot get newest sha: %v", err)
+		return nil, btcjson.ErrBlockNotFound
+	}
+
+	blockHeader := &blk.MsgBlock().Header
+	blockReply := btcjson.BlockResult{
+		Hash:          c.Hash,
+		Version:       blockHeader.Version,
+		MerkleRoot:    blockHeader.MerkleRoot.String(),
+		PreviousHash:  blockHeader.PrevBlock.String(),
+		Nonce:         blockHeader.Nonce,
+		Time:          blockHeader.Timestamp.Unix(),
+		Confirmations: uint64(1 + maxidx - idx),
+		Height:        idx,
+		Tx:            txNames,
+		Size:          len(buf),
+		Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
+		Difficulty:    getDifficultyRatio(blockHeader.Bits),
+	}
+
+	// Get next block unless we are already at the top.
+	if idx < maxidx {
+		var shaNext *btcwire.ShaHash
+		shaNext, err = s.server.db.FetchBlockShaByHeight(int64(idx + 1))
 		if err != nil {
-			log.Errorf(msg)
-			return
+			log.Errorf("RPCS: No next block: %v", err)
+			return nil, btcjson.ErrBlockNotFound
 		}
-		log.Debugf(msg)
+		blockReply.NextHash = shaNext.String()
+	}
+
+	return blockReply, nil
+}
+
+// handleGetBlockCount implements the getblockcount command.
+func handleGetBlockCount(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	_, maxidx, err := s.server.db.NewestSha()
+	if err != nil {
+		log.Errorf("RPCS: Error getting newest sha: %v", err)
+		return nil, btcjson.ErrBlockCount
+	}
+
+	return maxidx, nil
+}
+
+// handleGetBlockHash implements the getblockhash command.
+func handleGetBlockHash(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	c := cmd.(*btcjson.GetBlockHashCmd)
+	sha, err := s.server.db.FetchBlockShaByHeight(c.Index)
+	if err != nil {
+		log.Errorf("[RCPS] Error getting block: %v", err)
+		return nil, btcjson.ErrOutOfRange
+	}
+
+	return sha.String(), nil
+}
+
+// handleGetConnectionCount implements the getconnectioncount command.
+func handleGetConnectionCount(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	return s.server.ConnectedCount(), nil
+}
+
+// handleGetDifficulty implements the getdifficulty command.
+func handleGetDifficulty(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	sha, _, err := s.server.db.NewestSha()
+	if err != nil {
+		log.Errorf("RPCS: Error getting sha: %v", err)
+		return nil, btcjson.ErrDifficulty
+	}
+	blk, err := s.server.db.FetchBlockBySha(sha)
+	if err != nil {
+		log.Errorf("RPCS: Error getting block: %v", err)
+		return nil, btcjson.ErrDifficulty
+	}
+	blockHeader := &blk.MsgBlock().Header
+
+	return getDifficultyRatio(blockHeader.Bits), nil
+}
+
+// handleGetGenerate implements the getgenerate command.
+func handleGetGenerate(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	// btcd does not do mining so we can hardcode replies here.
+	return false, nil
+}
+
+// handleGetHashesPerSec implements the gethashespersec command.
+func handleGetHashesPerSec(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	// btcd does not do mining so we can hardcode replies here.
+	return 0, nil
+}
+
+// handleGetPeerInfo implements the getpeerinfo command.
+func handleGetPeerInfo(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	return s.server.PeerInfo(), nil
+}
+
+// handleGetRawMempool implements the getrawmempool command.
+func handleGetRawMempool(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	hashes := s.server.txMemPool.TxShas()
+	hashStrings := make([]string, len(hashes))
+	for i := 0; i < len(hashes); i++ {
+		hashStrings[i] = hashes[i].String()
+	}
+	return hashStrings, nil
+}
+
+// handleGetRawTransaction implements the getrawtransaction command.
+func handleGetRawTransaction(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	c := cmd.(*btcjson.GetRawTransactionCmd)
+	if c.Verbose {
+		// TODO: check error code. tx is not checked before
+		// this point.
+		txSha, _ := btcwire.NewShaHashFromStr(c.Txid)
+		txList, err := s.server.db.FetchTxBySha(txSha)
+		if err != nil {
+			log.Errorf("RPCS: Error fetching tx: %v", err)
+			return nil, btcjson.ErrNoTxInfo
+		}
+
+		lastTx := len(txList) - 1
+		txS := txList[lastTx].Tx
+		blksha := txList[lastTx].BlkSha
+		blk, err := s.server.db.FetchBlockBySha(blksha)
+		if err != nil {
+			log.Errorf("RPCS: Error fetching sha: %v", err)
+			return nil, btcjson.ErrBlockNotFound
+		}
+		idx := blk.Height()
+
+		txOutList := txS.TxOut
+		voutList := make([]btcjson.Vout, len(txOutList))
+
+		txInList := txS.TxIn
+		vinList := make([]btcjson.Vin, len(txInList))
+
+		for i, v := range txInList {
+			vinList[i].Sequence = float64(v.Sequence)
+			disbuf, _ := btcscript.DisasmString(v.SignatureScript)
+			vinList[i].ScriptSig.Asm = strings.Replace(disbuf, " ", "", -1)
+			vinList[i].Vout = i + 1
+			log.Debugf(disbuf)
+		}
+
+		for i, v := range txOutList {
+			voutList[i].N = i
+			voutList[i].Value = float64(v.Value) / 100000000
+			isbuf, _ := btcscript.DisasmString(v.PkScript)
+			voutList[i].ScriptPubKey.Asm = isbuf
+			voutList[i].ScriptPubKey.ReqSig = strings.Count(isbuf, "OP_CHECKSIG")
+			_, addrhash, err := btcscript.ScriptToAddrHash(v.PkScript)
+			if err != nil {
+				// TODO: set and return error?
+				log.Errorf("RPCS: Error getting address hash for %v: %v", txSha, err)
+			}
+			if addr, err := btcutil.EncodeAddress(addrhash, s.server.btcnet); err != nil {
+				// TODO: set and return error?
+				addrList := make([]string, 1)
+				addrList[0] = addr
+				voutList[i].ScriptPubKey.Addresses = addrList
+			}
+		}
+
+		_, maxidx, err := s.server.db.NewestSha()
+		if err != nil {
+			log.Errorf("RPCS: Cannot get newest sha: %v", err)
+			return nil, btcjson.ErrNoNewestBlockInfo
+		}
+		confirmations := uint64(1 + maxidx - idx)
+
+		blockHeader := &blk.MsgBlock().Header
+		txReply := btcjson.TxRawResult{
+			Txid:     c.Txid,
+			Vout:     voutList,
+			Vin:      vinList,
+			Version:  txS.Version,
+			LockTime: txS.LockTime,
+			// This is not a typo, they are identical in
+			// bitcoind as well.
+			Time:          blockHeader.Timestamp.Unix(),
+			Blocktime:     blockHeader.Timestamp.Unix(),
+			BlockHash:     blksha.String(),
+			Confirmations: confirmations,
+		}
+		return txReply, nil
+	} else {
+		// Don't return details
+		// not used yet
+		return nil, nil
 	}
 }
 
-// jsonRead abstracts the JSON unmarshalling and reply handling,
-// returning replies across a channel.  A channel is used as some websocket
-// method extensions require multiple replies.
-func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err error) {
-	var message btcjson.Message
-	err = json.Unmarshal(body, &message)
+// handleSendRawTransaction implements the sendrawtransaction command.
+func handleSendRawTransaction(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	c := cmd.(*btcjson.SendRawTransactionCmd)
+	// Deserialize and send off to tx relay
+	serializedTx, err := hex.DecodeString(c.HexTx)
 	if err != nil {
-		jsonError := btcjson.Error{
-			Code:    -32700,
-			Message: "Parse error",
+		return nil, btcjson.ErrDecodeHexString
+	}
+	msgtx := btcwire.NewMsgTx()
+	err = msgtx.Deserialize(bytes.NewBuffer(serializedTx))
+	if err != nil {
+		err := btcjson.Error{
+			Code:    btcjson.ErrDeserialization.Code,
+			Message: "Unable to deserialize raw tx",
+		}
+		return nil, err
+	}
+
+	tx := btcutil.NewTx(msgtx)
+	err = s.server.txMemPool.ProcessTransaction(tx)
+	if err != nil {
+		// When the error is a rule error, it means the transaction was
+		// simply rejected as opposed to something actually going wrong,
+		// so log it as such.  Otherwise, something really did go wrong,
+		// so log it as an actual error.
+		if _, ok := err.(TxRuleError); ok {
+			log.Debugf("RPCS: Rejected transaction %v: %v", tx.Sha(),
+				err)
+		} else {
+			log.Errorf("RPCS: Failed to process transaction %v: %v",
+				tx.Sha(), err)
+		}
+		err = btcjson.Error{
+			Code:    btcjson.ErrDeserialization.Code,
+			Message: "Failed to process transaction",
+		}
+		return nil, err
+	}
+
+	// If called from websocket code, add a mined tx hashes
+	// request.
+	if walletNotification != nil {
+		s.ws.requests.AddMinedTxRequest(walletNotification, tx.Sha())
+	}
+
+	return tx.Sha().String(), nil
+}
+
+// handleSetGenerate implements the setgenerate command.
+func handleSetGenerate(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	// btcd does not do mining so we can hardcode replies here.
+	return nil, nil
+}
+
+// handleStop implements the stop command.
+func handleStop(s *rpcServer, cmd btcjson.Cmd, walletNotification chan []byte) (interface{}, error) {
+	s.server.Stop()
+	return "btcd stopping.", nil
+}
+
+// jsonRead abstracts the JSON unmarshalling and reply handling used
+// by both RPC and websockets.  If called from websocket code, a non-nil
+// wallet notification channel can be used to automatically register
+// various notifications for the wallet.
+func jsonRead(body []byte, s *rpcServer, walletNotification chan []byte) (reply btcjson.Reply, err error) {
+	cmd, err := btcjson.ParseMarshaledCmd(body)
+	if err != nil {
+		var id interface{}
+		if cmd != nil {
+			// Unmarshaling a valid JSON-RPC message succeeded.  Use
+			// the provided id for errors.
+			id = cmd.Id()
 		}
 
+		if jsonErr, ok := err.(btcjson.Error); ok {
+			reply = btcjson.Reply{
+				Result: nil,
+				Error:  &jsonErr,
+				Id:     &id,
+			}
+		} else {
+			reply = btcjson.Reply{
+				Result: nil,
+				Error:  &jsonErr,
+				Id:     &id,
+			}
+		}
+
+		log.Tracef("RPCS: reply: %v", reply)
+
+		return reply, err
+	}
+	log.Tracef("RPCS: received: %v", cmd)
+
+	id := cmd.Id()
+
+	handler, ok := handlers[cmd.Method()]
+	if !ok {
+		reply = btcjson.Reply{
+			Result: nil,
+			Error:  &btcjson.ErrMethodNotFound,
+			Id:     &id,
+		}
+		return reply, btcjson.ErrMethodNotFound
+	}
+
+	result, err := handler(s, cmd, walletNotification)
+	if err != nil {
+		if jsonErr, ok := err.(btcjson.Error); ok {
+			reply = btcjson.Reply{
+				Error: &jsonErr,
+				Id:    &id,
+			}
+			err = errors.New(jsonErr.Message)
+		} else {
+			// In the case where we did not have a btcjson
+			// error to begin with, make a new one to send,
+			// but this really should not happen.
+			rawJSONError := btcjson.Error{
+				Code:    btcjson.ErrInternal.Code,
+				Message: err.Error(),
+			}
+			reply = btcjson.Reply{
+				Error: &rawJSONError,
+				Id:    &id,
+			}
+		}
+	} else {
+		reply = btcjson.Reply{
+			Result: result,
+			Id:     &id,
+		}
+	}
+
+	return reply, err
+}
+
+func jsonWSRead(walletNotification chan []byte, replychan chan *btcjson.Reply, body []byte, s *rpcServer) error {
+	var message btcjson.Message
+	err := json.Unmarshal(body, &message)
+	if err != nil {
 		reply := btcjson.Reply{
 			Result: nil,
-			Error:  &jsonError,
+			Error:  &btcjson.ErrParse,
 			Id:     nil,
 		}
 
@@ -247,495 +741,13 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 	log.Tracef("RPCS: received: %v", message)
 
 	var rawReply btcjson.Reply
-	requester := false
-
 	defer func() {
 		replychan <- &rawReply
-		if !requester {
-			close(replychan)
-		}
+		close(replychan)
 	}()
 
 	// Deal with commands
 	switch message.Method {
-	case "stop":
-		rawReply = btcjson.Reply{
-			Result: "btcd stopping.",
-			Error:  nil,
-			Id:     &message.Id,
-		}
-		s.server.Stop()
-	case "getblockcount":
-		_, maxidx, err := s.server.db.NewestSha()
-		if err != nil {
-			log.Errorf("RPCS: Error getting newest sha: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Error getting block count",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-		rawReply = btcjson.Reply{
-			Result: maxidx,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "getbestblockhash":
-		sha, _, err := s.server.db.NewestSha()
-		if err != nil {
-			log.Errorf("RPCS: Error getting newest sha: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Error getting best block hash",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-		rawReply = btcjson.Reply{
-			Result: sha,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "getdifficulty":
-		sha, _, err := s.server.db.NewestSha()
-		if err != nil {
-			log.Errorf("RPCS: Error getting sha: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Error Getting difficulty",
-			}
-
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-		blk, err := s.server.db.FetchBlockBySha(sha)
-		if err != nil {
-			log.Errorf("RPCS: Error getting block: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Error Getting difficulty",
-			}
-
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-		blockHeader := &blk.MsgBlock().Header
-		rawReply = btcjson.Reply{
-			Result: getDifficultyRatio(blockHeader.Bits),
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	// btcd does not do mining so we can hardcode replies here.
-	case "getgenerate":
-		rawReply = btcjson.Reply{
-			Result: false,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "setgenerate":
-		rawReply = btcjson.Reply{
-			Result: nil,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "gethashespersec":
-		rawReply = btcjson.Reply{
-			Result: 0,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "getblockhash":
-		var f interface{}
-		err = json.Unmarshal(body, &f)
-		m := f.(map[string]interface{})
-		var idx float64
-		for _, v := range m {
-			switch vv := v.(type) {
-			case []interface{}:
-				for _, u := range vv {
-					idx, _ = u.(float64)
-				}
-			default:
-			}
-		}
-		sha, err := s.server.db.FetchBlockShaByHeight(int64(idx))
-		if err != nil {
-			log.Errorf("[RCPS] Error getting block: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -1,
-				Message: "Block number out of range.",
-			}
-
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-
-		}
-
-		rawReply = btcjson.Reply{
-			Result: sha.String(),
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "getblock":
-		var f interface{}
-		err = json.Unmarshal(body, &f)
-		m := f.(map[string]interface{})
-		var hash string
-		for _, v := range m {
-			switch vv := v.(type) {
-			case []interface{}:
-				for _, u := range vv {
-					hash, _ = u.(string)
-				}
-			default:
-			}
-		}
-		sha, err := btcwire.NewShaHashFromStr(hash)
-		if err != nil {
-			log.Errorf("RPCS: Error generating sha: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Block not found",
-			}
-
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-		blk, err := s.server.db.FetchBlockBySha(sha)
-		if err != nil {
-			log.Errorf("RPCS: Error fetching sha: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Block not found",
-			}
-
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-		idx := blk.Height()
-		buf, err := blk.Bytes()
-		if err != nil {
-			log.Errorf("RPCS: Error fetching block: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -5,
-				Message: "Block not found",
-			}
-
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			log.Tracef("RPCS: reply: %v", rawReply)
-			break
-		}
-
-		txList, _ := blk.TxShas()
-
-		txNames := make([]string, len(txList))
-		for i, v := range txList {
-			txNames[i] = v.String()
-		}
-
-		_, maxidx, err := s.server.db.NewestSha()
-		if err != nil {
-			return fmt.Errorf("RPCS: Cannot get newest sha: %v", err)
-		}
-
-		blockHeader := &blk.MsgBlock().Header
-		blockReply := btcjson.BlockResult{
-			Hash:          hash,
-			Version:       blockHeader.Version,
-			MerkleRoot:    blockHeader.MerkleRoot.String(),
-			PreviousHash:  blockHeader.PrevBlock.String(),
-			Nonce:         blockHeader.Nonce,
-			Time:          blockHeader.Timestamp.Unix(),
-			Confirmations: uint64(1 + maxidx - idx),
-			Height:        idx,
-			Tx:            txNames,
-			Size:          len(buf),
-			Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
-			Difficulty:    getDifficultyRatio(blockHeader.Bits),
-		}
-
-		// Get next block unless we are already at the top.
-		if idx < maxidx {
-			shaNext, err := s.server.db.FetchBlockShaByHeight(int64(idx + 1))
-			if err != nil {
-				log.Errorf("RPCS: No next block: %v", err)
-			} else {
-				blockReply.NextHash = shaNext.String()
-			}
-		}
-
-		rawReply = btcjson.Reply{
-			Result: blockReply,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "getrawtransaction":
-		var f interface{}
-		err = json.Unmarshal(body, &f)
-		m := f.(map[string]interface{})
-		var tx string
-		var verbose float64
-		for _, v := range m {
-			switch vv := v.(type) {
-			case []interface{}:
-				for _, u := range vv {
-					switch uu := u.(type) {
-					case string:
-						tx = uu
-					case float64:
-						verbose = uu
-					default:
-					}
-				}
-			default:
-			}
-		}
-
-		if int(verbose) != 0 {
-			txSha, _ := btcwire.NewShaHashFromStr(tx)
-			var txS *btcwire.MsgTx
-			txList, err := s.server.db.FetchTxBySha(txSha)
-			if err != nil {
-				log.Errorf("RPCS: Error fetching tx: %v", err)
-				jsonError := btcjson.Error{
-					Code:    -5,
-					Message: "No information available about transaction",
-				}
-
-				rawReply = btcjson.Reply{
-					Result: nil,
-					Error:  &jsonError,
-					Id:     &message.Id,
-				}
-				log.Tracef("RPCS: reply: %v", rawReply)
-				break
-			}
-
-			lastTx := len(txList) - 1
-			txS = txList[lastTx].Tx
-			blksha := txList[lastTx].BlkSha
-			blk, err := s.server.db.FetchBlockBySha(blksha)
-			if err != nil {
-				log.Errorf("RPCS: Error fetching sha: %v", err)
-				jsonError := btcjson.Error{
-					Code:    -5,
-					Message: "Block not found",
-				}
-
-				rawReply = btcjson.Reply{
-					Result: nil,
-					Error:  &jsonError,
-					Id:     &message.Id,
-				}
-				log.Tracef("RPCS: reply: %v", rawReply)
-				break
-			}
-			idx := blk.Height()
-
-			txOutList := txS.TxOut
-			voutList := make([]btcjson.Vout, len(txOutList))
-
-			txInList := txS.TxIn
-			vinList := make([]btcjson.Vin, len(txInList))
-
-			for i, v := range txInList {
-				vinList[i].Sequence = float64(v.Sequence)
-				disbuf, _ := btcscript.DisasmString(v.SignatureScript)
-				vinList[i].ScriptSig.Asm = strings.Replace(disbuf, " ", "", -1)
-				vinList[i].Vout = i + 1
-				log.Debugf(disbuf)
-			}
-
-			for i, v := range txOutList {
-				voutList[i].N = i
-				voutList[i].Value = float64(v.Value) / 100000000
-				isbuf, _ := btcscript.DisasmString(v.PkScript)
-				voutList[i].ScriptPubKey.Asm = isbuf
-				voutList[i].ScriptPubKey.ReqSig = strings.Count(isbuf, "OP_CHECKSIG")
-				_, addrhash, err := btcscript.ScriptToAddrHash(v.PkScript)
-				if err != nil {
-					log.Errorf("RPCS: Error getting address hash for %v: %v", txSha, err)
-				}
-				if addr, err := btcutil.EncodeAddress(addrhash, s.server.btcnet); err != nil {
-					addrList := make([]string, 1)
-					addrList[0] = addr
-					voutList[i].ScriptPubKey.Addresses = addrList
-				}
-			}
-
-			_, maxidx, err := s.server.db.NewestSha()
-			if err != nil {
-				return fmt.Errorf("RPCS: Cannot get newest sha: %v", err)
-			}
-			confirmations := uint64(1 + maxidx - idx)
-
-			blockHeader := &blk.MsgBlock().Header
-			txReply := btcjson.TxRawResult{
-				Txid:     tx,
-				Vout:     voutList,
-				Vin:      vinList,
-				Version:  txS.Version,
-				LockTime: txS.LockTime,
-				// This is not a typo, they are identical in
-				// bitcoind as well.
-				Time:          blockHeader.Timestamp.Unix(),
-				Blocktime:     blockHeader.Timestamp.Unix(),
-				BlockHash:     blksha.String(),
-				Confirmations: confirmations,
-			}
-			rawReply = btcjson.Reply{
-				Result: txReply,
-				Error:  nil,
-				Id:     &message.Id,
-			}
-		} else {
-			// Don't return details
-			// not used yet
-		}
-	case "decoderawtransaction":
-		var f interface{}
-		err = json.Unmarshal(body, &f)
-		m := f.(map[string]interface{})
-		var hash string
-		for _, v := range m {
-			switch vv := v.(type) {
-			case []interface{}:
-				for _, u := range vv {
-					hash, _ = u.(string)
-				}
-			default:
-			}
-		}
-		spew.Dump(hash)
-		txReply := btcjson.TxRawDecodeResult{}
-		rawReply = btcjson.Reply{
-			Result: txReply,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-	case "sendrawtransaction":
-		params, ok := message.Params.([]interface{})
-		if !ok || len(params) != 1 {
-			jsonError := btcjson.Error{
-				Code:    -32602,
-				Message: "Invalid parameters",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			return ErrBadParamsField
-		}
-		serializedtxhex, ok := params[0].(string)
-		if !ok {
-			jsonError := btcjson.Error{
-				Code:    -32602,
-				Message: "Raw tx is not a string",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			return ErrBadParamsField
-		}
-
-		// Deserialize and send off to tx relay
-		serializedtx, err := hex.DecodeString(serializedtxhex)
-		if err != nil {
-			jsonError := btcjson.Error{
-				Code:    -22,
-				Message: "Unable to decode hex string",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			return err
-		}
-		msgtx := btcwire.NewMsgTx()
-		err = msgtx.Deserialize(bytes.NewBuffer(serializedtx))
-		if err != nil {
-			jsonError := btcjson.Error{
-				Code:    -22,
-				Message: "Unable to deserialize raw tx",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			return err
-		}
-		err = s.server.txMemPool.ProcessTransaction(msgtx)
-		if err != nil {
-			log.Errorf("RPCS: Failed to process transaction: %v", err)
-			jsonError := btcjson.Error{
-				Code:    -22,
-				Message: "Failed to process transaction",
-			}
-			rawReply = btcjson.Reply{
-				Result: nil,
-				Error:  &jsonError,
-				Id:     &message.Id,
-			}
-			return err
-		}
-
-		var result interface{}
-		txsha, err := msgtx.TxSha()
-		if err == nil {
-			result = txsha.String()
-		}
-		rawReply = btcjson.Reply{
-			Result: result,
-			Error:  nil,
-			Id:     &message.Id,
-		}
-
-	// Extensions
 	case "getcurrentnet":
 		var net btcwire.BitcoinNet
 		if cfg.TestNet3 {
@@ -795,15 +807,18 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 					return err
 				}
 				txList := s.server.db.FetchTxByShaList(txShaList)
-				for j := range txList {
-					for _, txout := range txList[j].Tx.TxOut {
+				for _, txReply := range txList {
+					if txReply.Err != nil || txReply.Tx == nil {
+						continue
+					}
+					for _, txout := range txReply.Tx.TxOut {
 						_, txaddrhash, err := btcscript.ScriptToAddrHash(txout.PkScript)
 						if err != nil {
 							return err
 						}
 						if !bytes.Equal(addrhash, txaddrhash) {
 							reply := btcjson.Reply{
-								Result: txList[j].Sha,
+								Result: txReply.Sha,
 								Error:  nil,
 								Id:     &message.Id,
 							}
@@ -829,26 +844,18 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 	case "notifynewtxs":
 		params, ok := message.Params.([]interface{})
 		if !ok || len(params) != 1 {
-			jsonError := btcjson.Error{
-				Code:    -32602,
-				Message: "Invalid parameters",
-			}
 			rawReply = btcjson.Reply{
 				Result: nil,
-				Error:  &jsonError,
+				Error:  &btcjson.ErrInvalidParams,
 				Id:     &message.Id,
 			}
 			return ErrBadParamsField
 		}
 		addr, ok := params[0].(string)
 		if !ok {
-			jsonError := btcjson.Error{
-				Code:    -32602,
-				Message: "Invalid parameters",
-			}
 			rawReply = btcjson.Reply{
 				Result: nil,
-				Error:  &jsonError,
+				Error:  &btcjson.ErrInvalidParams,
 				Id:     &message.Id,
 			}
 			return ErrBadParamsField
@@ -856,7 +863,7 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 		addrhash, _, err := btcutil.DecodeAddress(addr)
 		if err != nil {
 			jsonError := btcjson.Error{
-				Code:    -32602,
+				Code:    btcjson.ErrInvalidParams.Code,
 				Message: "Cannot decode address",
 			}
 			rawReply = btcjson.Reply{
@@ -868,32 +875,20 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 		}
 		var hash addressHash
 		copy(hash[:], addrhash)
-		s.ws.txRequests.Lock()
-		cxts := s.ws.txRequests.m[hash]
-		cxt := requesterContext{
-			c:  replychan,
-			id: message.Id,
-		}
-		s.ws.txRequests.m[hash] = append(cxts, cxt)
-		s.ws.txRequests.Unlock()
+		s.ws.requests.AddTxRequest(walletNotification, hash, message.Id)
 
 		rawReply = btcjson.Reply{
 			Result: nil,
 			Error:  nil,
 			Id:     &message.Id,
 		}
-		requester = true
 
 	case "notifyspent":
 		params, ok := message.Params.([]interface{})
 		if !ok || len(params) != 2 {
-			jsonError := btcjson.Error{
-				Code:    -32602,
-				Message: "Invalid parameters",
-			}
 			rawReply = btcjson.Reply{
 				Result: nil,
-				Error:  &jsonError,
+				Error:  &btcjson.ErrInvalidParams,
 				Id:     &message.Id,
 			}
 			return ErrBadParamsField
@@ -901,22 +896,17 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 		hashBE, ok1 := params[0].(string)
 		index, ok2 := params[1].(float64)
 		if !ok1 || !ok2 {
-			jsonError := btcjson.Error{
-				Code:    -32602,
-				Message: "Invalid parameters",
-			}
 			rawReply = btcjson.Reply{
 				Result: nil,
-				Error:  &jsonError,
+				Error:  &btcjson.ErrInvalidParams,
 				Id:     &message.Id,
 			}
 			return ErrBadParamsField
 		}
-		s.ws.spentRequests.Lock()
 		hash, err := btcwire.NewShaHashFromStr(hashBE)
 		if err != nil {
 			jsonError := btcjson.Error{
-				Code:    -32602,
+				Code:    btcjson.ErrInvalidParams.Code,
 				Message: "Hash string cannot be parsed.",
 			}
 			rawReply = btcjson.Reply{
@@ -927,34 +917,22 @@ func jsonRead(replychan chan *btcjson.Reply, body []byte, s *rpcServer) (err err
 			return ErrBadParamsField
 		}
 		op := btcwire.NewOutPoint(hash, uint32(index))
-		cxts := s.ws.spentRequests.m[*op]
-		cxt := requesterContext{
-			c:  replychan,
-			id: message.Id,
-		}
-		s.ws.spentRequests.m[*op] = append(cxts, cxt)
-		s.ws.spentRequests.Unlock()
+		s.ws.requests.AddSpentRequest(walletNotification, op, message.Id)
 
 		rawReply = btcjson.Reply{
 			Result: nil,
 			Error:  nil,
 			Id:     &message.Id,
 		}
-		requester = true
 
 	default:
-		jsonError := btcjson.Error{
-			Code:    -32601,
-			Message: "Method not found",
-		}
 		rawReply = btcjson.Reply{
 			Result: nil,
-			Error:  &jsonError,
+			Error:  &btcjson.ErrMethodNotFound,
 			Id:     &message.Id,
 		}
 	}
-
-	return nil
+	return btcjson.ErrMethodNotFound
 }
 
 // getDifficultyRatio returns the proof-of-work difficulty as a multiple of the
@@ -980,58 +958,32 @@ func getDifficultyRatio(bits uint32) float64 {
 // AddWalletListener adds a channel to listen for new messages from a
 // wallet.
 func (s *rpcServer) AddWalletListener(c chan []byte) {
-	s.ws.addWalletListener <- c
+	s.ws.walletListeners.Lock()
+	s.ws.walletListeners.m[c] = true
+	s.ws.walletListeners.Unlock()
 }
 
 // RemoveWalletListener removes a wallet listener channel.
 func (s *rpcServer) RemoveWalletListener(c chan []byte) {
-	s.ws.removeWalletListener <- c
+	s.ws.walletListeners.Lock()
+	delete(s.ws.walletListeners.m, c)
+	s.ws.walletListeners.Unlock()
 }
 
 // walletListenerDuplicator listens for new wallet listener channels
 // and duplicates messages sent to walletNotificationMaster to all
 // connected listeners.
 func (s *rpcServer) walletListenerDuplicator() {
-	// walletListeners is a map holding each currently connected wallet
-	// listener as the key.  The value is ignored, as this is only used as
-	// a set.
-	walletListeners := make(map[chan []byte]bool)
-
-	// Don't want to add or delete a wallet listener while iterating
-	// through each to propigate to every attached wallet.  Use a mutex to
-	// prevent this.
-	var mtx sync.Mutex
-
-	// Check for listener channels to add or remove from set.
-	go func() {
-		for {
-			select {
-			case c := <-s.ws.addWalletListener:
-				mtx.Lock()
-				walletListeners[c] = true
-				mtx.Unlock()
-
-			case c := <-s.ws.removeWalletListener:
-				mtx.Lock()
-				delete(walletListeners, c)
-				mtx.Unlock()
-
-			case <-s.quit:
-				return
-			}
-		}
-	}()
-
 	// Duplicate all messages sent across walletNotificationMaster to each
 	// listening wallet.
 	for {
 		select {
 		case ntfn := <-s.ws.walletNotificationMaster:
-			mtx.Lock()
-			for c := range walletListeners {
+			s.ws.walletListeners.RLock()
+			for c := range s.ws.walletListeners.m {
 				c <- ntfn
 			}
-			mtx.Unlock()
+			s.ws.walletListeners.RUnlock()
 
 		case <-s.quit:
 			return
@@ -1097,14 +1049,27 @@ func (s *rpcServer) walletReqsNotifications(ws *websocket.Conn) {
 // websocketJSONHandler parses and handles a marshalled json message,
 // sending the marshalled reply to a wallet notification channel.
 func (s *rpcServer) websocketJSONHandler(walletNotification chan []byte, msg []byte) {
-	replychan := make(chan *btcjson.Reply)
+	s.wg.Add(1)
+	reply, err := jsonRead(msg, s, walletNotification)
+	s.wg.Done()
 
+	if err != btcjson.ErrMethodNotFound {
+		replyBytes, err := json.Marshal(reply)
+		if err != nil {
+			log.Errorf("RPCS: Error marshalling reply: %v", err)
+		}
+		walletNotification <- replyBytes
+		return
+	}
+
+	// Try websocket extensions
+	replychan := make(chan *btcjson.Reply)
 	go func() {
 		for {
 			select {
 			case reply, ok := <-replychan:
 				if !ok {
-					// jsonRead() function called below has finished.
+					// no more replies expected.
 					return
 				}
 				if reply == nil {
@@ -1113,7 +1078,7 @@ func (s *rpcServer) websocketJSONHandler(walletNotification chan []byte, msg []b
 				log.Tracef("[RPCS] reply: %v", *reply)
 				replyBytes, err := json.Marshal(reply)
 				if err != nil {
-					log.Errorf("[RPCS] Error Marshalling reply: %v", err)
+					log.Errorf("RPCS: Error Marshalling reply: %v", err)
 					return
 				}
 				walletNotification <- replyBytes
@@ -1123,40 +1088,69 @@ func (s *rpcServer) websocketJSONHandler(walletNotification chan []byte, msg []b
 			}
 		}
 	}()
-
 	s.wg.Add(1)
-	err := jsonRead(replychan, msg, s)
+	err = jsonWSRead(walletNotification, replychan, msg, s)
 	s.wg.Done()
-	if err != nil {
-		log.Error(err)
-	}
 }
 
 // NotifyBlockConnected creates and marshalls a JSON message to notify
 // of a new block connected to the main chain.  The notification is sent
 // to each connected wallet.
 func (s *rpcServer) NotifyBlockConnected(block *btcutil.Block) {
-	var id interface{} = "btcd:blockconnected"
-	hash, err := block.Sha()
-	if err != nil {
-		log.Error("Bad block; connected block notification dropped.")
-		return
-	}
-	ntfn := btcjson.Reply{
-		Result: struct {
-			Hash   string `json:"hash"`
-			Height int64  `json:"height"`
+	s.ws.walletListeners.RLock()
+	for wltNtfn := range s.ws.walletListeners.m {
+		// Create notification with basic information filled in.
+		// This data is the same for every connected wallet.
+		hash, err := block.Sha()
+		if err != nil {
+			log.Error("Bad block; connected block notification dropped.")
+			return
+		}
+		ntfnResult := struct {
+			Hash     string   `json:"hash"`
+			Height   int64    `json:"height"`
+			MinedTXs []string `json:"minedtxs"`
 		}{
 			Hash:   hash.String(),
 			Height: block.Height(),
-		},
-		Id: &id,
+		}
+
+		// Fill in additional wallet-specific notifications.  If there
+		// is no request context for this wallet, no need to give this
+		// wallet any extra notifications.
+		if cxt := s.ws.requests.m[wltNtfn]; cxt != nil {
+			// Create list of all txs created by this wallet that appear in this
+			// block.
+			minedTxShas := make([]string, 0, len(cxt.minedTxRequests))
+
+			// TxShas does not return a non-nil error.
+			txShaList, _ := block.TxShas()
+			txList := s.server.db.FetchTxByShaList(txShaList)
+			for _, txReply := range txList {
+				if txReply.Err != nil {
+					continue
+				}
+				if _, ok := cxt.minedTxRequests[*txReply.Sha]; ok {
+					minedTxShas = append(minedTxShas, txReply.Sha.String())
+					s.ws.requests.RemoveMinedTxRequest(wltNtfn, txReply.Sha)
+				}
+			}
+
+			ntfnResult.MinedTXs = minedTxShas
+		}
+
+		var id interface{} = "btcd:blockconnected"
+		ntfn := btcjson.Reply{
+			Result: ntfnResult,
+			Id:     &id,
+		}
+		m, _ := json.Marshal(ntfn)
+		wltNtfn <- m
 	}
-	m, _ := json.Marshal(ntfn)
-	s.ws.walletNotificationMaster <- m
+	s.ws.walletListeners.RUnlock()
 }
 
-// NotifyBlockDisconnected creates and marshalls a JSON message to notify
+// NotifyBlockDisconnected creates and marshals a JSON message to notify
 // of a new block disconnected from the main chain.  The notification is sent
 // to each connected wallet.
 func (s *rpcServer) NotifyBlockDisconnected(block *btcutil.Block) {
@@ -1180,114 +1174,132 @@ func (s *rpcServer) NotifyBlockDisconnected(block *btcutil.Block) {
 	s.ws.walletNotificationMaster <- m
 }
 
-// NotifyNewTxListeners creates and marshals a JSON message to notify wallets
+// NotifyBlockTXs creates and marshals a JSON message to notify wallets
 // of new transactions (with both spent and unspent outputs) for a watched
 // address.
-func (s *rpcServer) NotifyNewTxListeners(db btcdb.Db, block *btcutil.Block) {
-	txShaList, err := block.TxShas()
-	if err != nil {
-		log.Error("Bad block; All notifications for block dropped.")
-		return
+func (s *rpcServer) NotifyBlockTXs(db btcdb.Db, block *btcutil.Block) {
+	// Build a map of in-flight transactions to see if any of the inputs in
+	// this block are referencing other transactions earlier in this block.
+	txInFlight := map[btcwire.ShaHash]int{}
+	transactions := block.Transactions()
+	spent := make([][]bool, len(transactions))
+	for i, tx := range transactions {
+		spent[i] = make([]bool, len(tx.MsgTx().TxOut))
+		txInFlight[*tx.Sha()] = i
 	}
-	txList := db.FetchTxByShaList(txShaList)
-	for _, tx := range txList {
-		go s.newBlockNotifyCheckTxIn(tx.Tx.TxIn)
-		go s.newBlockNotifyCheckTxOut(db, block, tx)
+
+	// The newBlockNotifyCheckTxOut current needs spent data.  This can
+	// this can ultimately be optimized out by making sure the notifications
+	// are in order.  For now, just create the spent data.
+	for i, tx := range transactions[1:] {
+		for _, txIn := range tx.MsgTx().TxIn {
+			originHash := &txIn.PreviousOutpoint.Hash
+			if inFlightIndex, ok := txInFlight[*originHash]; ok &&
+				i >= inFlightIndex {
+
+				prevIndex := txIn.PreviousOutpoint.Index
+				spent[inFlightIndex][prevIndex] = true
+			}
+		}
+	}
+
+	for i, tx := range transactions {
+		go s.newBlockNotifyCheckTxIn(tx)
+		go s.newBlockNotifyCheckTxOut(block, tx, spent[i])
 	}
 }
 
 // newBlockNotifyCheckTxIn is a helper function to iterate through
 // each transaction input of a new block and perform any checks and
 // notify listening frontends when necessary.
-func (s *rpcServer) newBlockNotifyCheckTxIn(txins []*btcwire.TxIn) {
-	for _, txin := range txins {
-		s.ws.spentRequests.RLock()
-		for out, cxts := range s.ws.spentRequests.m {
-			if txin.PreviousOutpoint != out {
-				continue
-			}
+func (s *rpcServer) newBlockNotifyCheckTxIn(tx *btcutil.Tx) {
+	for wltNtfn, cxt := range s.ws.requests.m {
+		for _, txin := range tx.MsgTx().TxIn {
+			for op, id := range cxt.spentRequests {
+				if txin.PreviousOutpoint != op {
+					continue
+				}
 
-			reply := &btcjson.Reply{
-				Result: struct {
-					TxHash string `json:"txhash"`
-					Index  uint32 `json:"index"`
-				}{
-					TxHash: out.Hash.String(),
-					Index:  uint32(out.Index),
-				},
-				Error: nil,
-				// Id is set for each requester separately below.
+				reply := &btcjson.Reply{
+					Result: struct {
+						TxHash string `json:"txhash"`
+						Index  uint32 `json:"index"`
+					}{
+						TxHash: op.Hash.String(),
+						Index:  uint32(op.Index),
+					},
+					Error: nil,
+					Id:    &id,
+				}
+				replyBytes, err := json.Marshal(reply)
+				if err != nil {
+					log.Errorf("RPCS: Unable to marshal spent notification: %v", err)
+					continue
+				}
+				wltNtfn <- replyBytes
+				s.ws.requests.RemoveSpentRequest(wltNtfn, &op)
 			}
-			for _, cxt := range cxts {
-				reply.Id = &cxt.id
-				cxt.c <- reply
-			}
-
-			s.ws.spentRequests.RUnlock()
-			s.ws.spentRequests.Lock()
-			delete(s.ws.spentRequests.m, out)
-			s.ws.spentRequests.Unlock()
-			s.ws.spentRequests.RLock()
 		}
-		s.ws.spentRequests.RUnlock()
 	}
 }
 
 // newBlockNotifyCheckTxOut is a helper function to iterate through
 // each transaction output of a new block and perform any checks and
 // notify listening frontends when necessary.
-func (s *rpcServer) newBlockNotifyCheckTxOut(db btcdb.Db, block *btcutil.Block, tx *btcdb.TxListReply) {
-	for i, txout := range tx.Tx.TxOut {
-		_, txaddrhash, err := btcscript.ScriptToAddrHash(txout.PkScript)
-		if err != nil {
-			log.Debug("Error getting payment address from tx; dropping any Tx notifications.")
-			break
-		}
-		s.ws.txRequests.RLock()
-		for addr, cxts := range s.ws.txRequests.m {
-			if !bytes.Equal(addr[:], txaddrhash) {
-				continue
-			}
-			blkhash, err := block.Sha()
+func (s *rpcServer) newBlockNotifyCheckTxOut(block *btcutil.Block, tx *btcutil.Tx, spent []bool) {
+	for wltNtfn, cxt := range s.ws.requests.m {
+		for i, txout := range tx.MsgTx().TxOut {
+			_, txaddrhash, err := btcscript.ScriptToAddrHash(txout.PkScript)
 			if err != nil {
-				log.Error("Error getting block sha; dropping Tx notification.")
+				log.Debug("Error getting payment address from tx; dropping any Tx notifications.")
 				break
 			}
-			txaddr, err := btcutil.EncodeAddress(txaddrhash, s.server.btcnet)
-			if err != nil {
-				log.Error("Error encoding address; dropping Tx notification.")
-				break
-			}
-			reply := &btcjson.Reply{
-				Result: struct {
-					Sender    string `json:"sender"`
-					Receiver  string `json:"receiver"`
-					BlockHash string `json:"blockhash"`
-					Height    int64  `json:"height"`
-					TxHash    string `json:"txhash"`
-					Index     uint32 `json:"index"`
-					Amount    int64  `json:"amount"`
-					PkScript  string `json:"pkscript"`
-					Spent     bool   `json:"spent"`
-				}{
-					Sender:    "Unknown", // TODO(jrick)
-					Receiver:  txaddr,
-					BlockHash: blkhash.String(),
-					Height:    block.Height(),
-					TxHash:    tx.Sha.String(),
-					Index:     uint32(i),
-					Amount:    txout.Value,
-					PkScript:  btcutil.Base58Encode(txout.PkScript),
-					Spent:     tx.TxSpent[i],
-				},
-				Error: nil,
-				// Id is set for each requester separately below.
-			}
-			for _, cxt := range cxts {
-				reply.Id = &cxt.id
-				cxt.c <- reply
+			for addr, id := range cxt.txRequests {
+				if !bytes.Equal(addr[:], txaddrhash) {
+					continue
+				}
+				blkhash, err := block.Sha()
+				if err != nil {
+					log.Error("Error getting block sha; dropping Tx notification.")
+					break
+				}
+				txaddr, err := btcutil.EncodeAddress(txaddrhash, s.server.btcnet)
+				if err != nil {
+					log.Error("Error encoding address; dropping Tx notification.")
+					break
+				}
+				reply := &btcjson.Reply{
+					Result: struct {
+						Sender    string `json:"sender"`
+						Receiver  string `json:"receiver"`
+						BlockHash string `json:"blockhash"`
+						Height    int64  `json:"height"`
+						TxHash    string `json:"txhash"`
+						Index     uint32 `json:"index"`
+						Amount    int64  `json:"amount"`
+						PkScript  string `json:"pkscript"`
+						Spent     bool   `json:"spent"`
+					}{
+						Sender:    "Unknown", // TODO(jrick)
+						Receiver:  txaddr,
+						BlockHash: blkhash.String(),
+						Height:    block.Height(),
+						TxHash:    tx.Sha().String(),
+						Index:     uint32(i),
+						Amount:    txout.Value,
+						PkScript:  btcutil.Base58Encode(txout.PkScript),
+						Spent:     spent[i],
+					},
+					Error: nil,
+					Id:    &id,
+				}
+				replyBytes, err := json.Marshal(reply)
+				if err != nil {
+					log.Errorf("RPCS: Unable to marshal tx notification: %v", err)
+					continue
+				}
+				wltNtfn <- replyBytes
 			}
 		}
-		s.ws.txRequests.RUnlock()
 	}
 }

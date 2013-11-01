@@ -55,7 +55,7 @@ type donePeerMsg struct {
 // txMsg packages a bitcoin tx message and the peer it came from together
 // so the block handler has access to that information.
 type txMsg struct {
-	tx   *btcwire.MsgTx
+	tx   *btcutil.Tx
 	peer *peer
 }
 
@@ -269,12 +269,12 @@ func (b *blockManager) logBlockHeight(numTx, height int64, latestHash *btcwire.S
 // handleTxMsg handles transaction messages from all peers.
 func (b *blockManager) handleTxMsg(tmsg *txMsg) {
 	// Keep track of which peer the tx was sent from.
-	txHash, _ := tmsg.tx.TxSha()
+	txHash := tmsg.tx.Sha()
 
-	// If we didn't ask for this block then the peer is misbehaving.
-	if _, ok := tmsg.peer.requestedTxns[txHash]; !ok {
+	// If we didn't ask for this transaction then the peer is misbehaving.
+	if _, ok := tmsg.peer.requestedTxns[*txHash]; !ok {
 		log.Warnf("BMGR: Got unrequested transaction %v from %s -- "+
-			"disconnecting", &txHash, tmsg.peer.addr)
+			"disconnecting", txHash, tmsg.peer.addr)
 		tmsg.peer.Disconnect()
 		return
 	}
@@ -287,8 +287,8 @@ func (b *blockManager) handleTxMsg(tmsg *txMsg) {
 	// already knows about it and as such we shouldn't have any more
 	// instances of trying to fetch it, or we failed to insert and thus
 	// we'll retry next time we get an inv.
-	delete(tmsg.peer.requestedTxns, txHash)
-	delete(b.requestedTxns, txHash)
+	delete(tmsg.peer.requestedTxns, *txHash)
+	delete(b.requestedTxns, *txHash)
 
 	if err != nil {
 		// When the error is a rule error, it means the transaction was
@@ -302,6 +302,31 @@ func (b *blockManager) handleTxMsg(tmsg *txMsg) {
 		}
 		return
 	}
+}
+
+// current returns true if we believe we are synced with our peers, false if we
+// still have blocks to check
+func (b *blockManager) current() bool {
+	if !b.blockChain.IsCurrent() {
+		return false
+	}
+
+	// if blockChain thinks we are current and we have no syncPeer it
+	// is probably right.
+	if b.syncPeer == nil {
+		return true
+	}
+
+	_, height, err := b.server.db.NewestSha()
+	// No matter what chain thinks, if we are below the block we are
+	// syncing to we are not current.
+	// TODO(oga) we can get chain to return the height of each block when we
+	// parse an orphan, which would allow us to update the height of peers
+	// from what it was at initial handshake.
+	if err != nil || height < int64(b.syncPeer.lastBlock) {
+		return false
+	}
+	return true
 }
 
 // handleBlockMsg handles block messages from all peers.
@@ -401,13 +426,10 @@ func (b *blockManager) haveInventory(invVect *btcwire.InvVect) bool {
 
 // handleInvMsg handles inv messages from all peers.
 // We examine the inventory advertised by the remote peer and act accordingly.
-//
-// NOTE: This will need to have tx handling added as well when they are
-// supported.
 func (b *blockManager) handleInvMsg(imsg *invMsg) {
 	// Ignore invs from peers that aren't the sync if we are not current.
 	// Helps prevent fetching a mass of orphans.
-	if imsg.peer != b.syncPeer && !b.blockChain.IsCurrent() {
+	if imsg.peer != b.syncPeer && !b.current() {
 		return
 	}
 
@@ -521,7 +543,7 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 		}
 	}
 	if len(gdmsg.InvList) > 0 {
-		imsg.peer.QueueMessage(gdmsg)
+		imsg.peer.QueueMessage(gdmsg, nil)
 	}
 }
 
@@ -595,7 +617,8 @@ func (b *blockManager) handleNotifyMsg(notification *btcchain.Notification) {
 	case btcchain.NTBlockAccepted:
 		// Don't relay if we are not current. Other peers that are
 		// current should already know about it.
-		if !b.blockChain.IsCurrent() {
+
+		if !b.current() {
 			return
 		}
 
@@ -623,14 +646,14 @@ func (b *blockManager) handleNotifyMsg(notification *btcchain.Notification) {
 
 		// Remove all of the transactions (except the coinbase) in the
 		// connected block from the transaction pool.
-		for _, tx := range block.MsgBlock().Transactions[1:] {
+		for _, tx := range block.Transactions()[1:] {
 			b.server.txMemPool.removeTransaction(tx)
 		}
 
 		// Notify frontends
 		if r := b.server.rpcServer; r != nil {
 			go r.NotifyBlockConnected(block)
-			go r.NotifyNewTxListeners(b.server.db, block)
+			go r.NotifyBlockTXs(b.server.db, block)
 		}
 
 	// A block has been disconnected from the main block chain.
@@ -643,7 +666,7 @@ func (b *blockManager) handleNotifyMsg(notification *btcchain.Notification) {
 
 		// Reinsert all of the transactions (except the coinbase) into
 		// the transaction pool.
-		for _, tx := range block.MsgBlock().Transactions[1:] {
+		for _, tx := range block.Transactions()[1:] {
 			err := b.server.txMemPool.ProcessTransaction(tx)
 			if err != nil {
 				// Remove the transaction and all transactions
@@ -672,7 +695,7 @@ func (b *blockManager) NewPeer(p *peer) {
 
 // QueueTx adds the passed transaction message and peer to the block handling
 // queue.
-func (b *blockManager) QueueTx(tx *btcwire.MsgTx, p *peer) {
+func (b *blockManager) QueueTx(tx *btcutil.Tx, p *peer) {
 	// Don't accept more transactions if we're shutting down.
 	if atomic.LoadInt32(&b.shutdown) != 0 {
 		p.txProcessed <- false
